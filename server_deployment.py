@@ -9,19 +9,11 @@ from ray import serve
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-
 SAMPLE_RATE: int = 16000
 MIN_AUDIO_DURATION: float = 1.0
 MAX_BUFFER_SECONDS: int = 45
 DISCARD_SECONDS: int = 30
 SAME_OUTPUT_THRESHOLD: int = 10
-
-# ---------------------------------------------------------------------------
-# Per-session configuration
-# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -46,11 +38,6 @@ class AsrConfig:
         default_factory=lambda: [0.0, 0.2, 0.4, 0.6, 0.8, 1.0],
     )
     condition_on_previous_text: bool = True
-
-
-# ---------------------------------------------------------------------------
-# Client session
-# ---------------------------------------------------------------------------
 
 
 class ClientSession:
@@ -128,10 +115,6 @@ class ClientSession:
             logger.error("Send error for %s: %s", self.uid, e)
             self.connected = False
 
-
-# ---------------------------------------------------------------------------
-# Deployment
-# ---------------------------------------------------------------------------
 
 app = FastAPI()
 
@@ -245,9 +228,6 @@ class WhisperLiveServer:
                 del self.sessions[uid]
             logger.info("Client %s cleaned up", uid)
 
-    # ------------------------------------------------------------------
-    # Audio processing
-    # ------------------------------------------------------------------
 
     async def _audio_loop(self, session: ClientSession) -> None:
         """Receive audio frames and transcribe when ready."""
@@ -288,16 +268,15 @@ class WhisperLiveServer:
         self, session: ClientSession, audio: np.ndarray
     ) -> dict:
         """Dispatch a transcription request to the Ray transcriber."""
-        asr = session.asr
         return await self.transcriber_handle.transcribe.remote(
             audio=audio,
             language=session.language,
             task=session.task,
             initial_prompt=session.initial_prompt,
-            beam_size=asr.beam_size,
-            no_speech_threshold=asr.no_speech_threshold,
-            temperature=asr.temperature,
-            condition_on_previous_text=asr.condition_on_previous_text,
+            beam_size=session.asr.beam_size,
+            no_speech_threshold=session.asr.no_speech_threshold,
+            temperature=session.asr.temperature,
+            condition_on_previous_text=session.asr.condition_on_previous_text,
         )
 
     async def _transcribe_if_ready(self, session: ClientSession) -> None:
