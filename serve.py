@@ -1,13 +1,11 @@
-"""Ray Serve WhisperLive - Entry point for serving."""
-
 import argparse
 import logging
+import time
 
 import ray
 from ray import serve
 
-from vad_deployment import VADDetector
-from transcriber_deployment import WhisperTranscriberDeployment
+from transcriber_deployment import WhisperTranscriber
 from server_deployment import WhisperLiveServer
 
 logging.basicConfig(
@@ -17,101 +15,29 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def build_app(
-    vad_threshold: float = 0.5,
-    model_size: str = "large-v3-turbo",
-    beam_size: int = 5,
-    no_speech_threshold: float = 0.45,
-):
-    """
-    Build the Ray Serve application graph.
-
-    Args:
-        vad_threshold: VAD speech probability threshold
-        model_size: Whisper model size
-        beam_size: Beam size for decoding
-        no_speech_threshold: Threshold for filtering silent segments
-
-    Returns:
-        Ray Serve deployment handle
-    """
-    logger.info("Building WhisperLive application...")
-
-    vad = VADDetector.options(name="VADDetector").bind(threshold=vad_threshold)
-
-    transcriber = WhisperTranscriberDeployment.options(name="WhisperTranscriber").bind(
-        model_size=model_size,
-        beam_size=beam_size,
-        no_speech_threshold=no_speech_threshold,
-    )
-
-    server = WhisperLiveServer.options(name="WhisperLiveServer").bind(
-        vad_handle=vad,
-        transcriber_handle=transcriber,
-    )
-
-    server_handle = serve.run(server, route_prefix="/")
-
-    logger.info("WhisperLive application deployed")
-    logger.info(f"  VAD threshold: {vad_threshold}")
-    logger.info(f"  Model: {model_size}")
-    logger.info(f"  Beam size: {beam_size}")
-    logger.info(f"  No-speech threshold: {no_speech_threshold}")
-    logger.info(f"  WebSocket endpoint: ws://<host>:8000/listen")
-
-    return server_handle
-
-
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description="Ray Serve WhisperLive")
     parser.add_argument(
-        "--vad-threshold",
-        type=float,
-        default=0.5,
-        help="VAD speech probability threshold",
-    )
-    parser.add_argument(
-        "--model-size",
-        type=str,
-        default="large-v3-turbo",
-        help="Whisper model size",
-    )
-    parser.add_argument(
-        "--beam-size",
-        type=int,
-        default=5,
-        help="Beam size for decoding",
-    )
-    parser.add_argument(
-        "--no-speech-threshold",
-        type=float,
-        default=0.45,
-        help="Threshold for filtering silent segments",
+        "--model-size", default="large-v3-turbo", help="Whisper model size"
     )
     args = parser.parse_args()
 
-    logger.info("Initializing Ray...")
-    ray.init(
-        num_cpus=4,
-        num_gpus=1,
-        ignore_reinit_error=True,
+    ray.init(num_cpus=4, num_gpus=1, ignore_reinit_error=True)
+    logger.info(
+        "Ray: %.0f GPUs, %.0f CPUs",
+        ray.available_resources().get("GPU", 0),
+        ray.available_resources().get("CPU", 0),
     )
 
-    logger.info("Ray initialized")
-    logger.info(f"  GPUs: {ray.available_resources().get('GPU', 0)}")
-    logger.info(f"  CPUs: {ray.available_resources().get('CPU', 0)}")
+    transcriber = WhisperTranscriber.bind(model_size=args.model_size)
+    server = WhisperLiveServer.bind(transcriber_handle=transcriber)
+    serve.run(server, route_prefix="/")
 
-    build_app(
-        vad_threshold=args.vad_threshold,
-        model_size=args.model_size,
-        beam_size=args.beam_size,
-        no_speech_threshold=args.no_speech_threshold,
+    logger.info(
+        "WhisperLive ready: ws://localhost:8000/listen (model=%s)", args.model_size
     )
 
-    logger.info("Server running. Press Ctrl+C to stop.")
     try:
-        import time
-
         while True:
             time.sleep(1)
     except KeyboardInterrupt:

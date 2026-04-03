@@ -1,10 +1,9 @@
-"""Benchmark script: RTF and WER measurement."""
-
+import argparse
 import asyncio
 import json
+import re
 import time
 import uuid
-import os
 
 import numpy as np
 import soundfile as sf
@@ -13,7 +12,20 @@ from jiwer import wer
 
 
 def load_audio(file_path: str, target_sr: int = 16000) -> np.ndarray:
-    """Load and resample audio file to target sample rate."""
+    """Load an audio file and resample to *target_sr* Hz mono float32.
+
+    Parameters
+    ----------
+    file_path : str
+        Path to any format supported by *libsndfile*.
+    target_sr : int
+        Target sample rate in Hz.
+
+    Returns
+    -------
+    np.ndarray
+        1-D float32 array normalised to ``[-1, 1]``.
+    """
     audio, sr = sf.read(file_path, dtype="float32")
     if audio.ndim > 1:
         audio = audio.mean(axis=1)
@@ -25,14 +37,44 @@ def load_audio(file_path: str, target_sr: int = 16000) -> np.ndarray:
     return audio
 
 
+def _normalize(text: str) -> str:
+    """Lower-case, strip punctuation, collapse whitespace."""
+    text = text.lower()
+    text = re.sub(r"[^\w\s]", "", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
 async def transcribe_file(
     file_path: str,
+    *,
     host: str = "localhost",
     port: int = 8000,
     language: str | None = None,
     task: str = "transcribe",
     chunk_duration: float = 0.5,
-):
+) -> tuple[str, float, float, float, list[dict]]:
+    """Stream an audio file and collect completed segments.
+
+    Parameters
+    ----------
+    file_path : str
+        Path to the audio file.
+    host : str
+        Server hostname.
+    port : int
+        Server port.
+    language : str or None
+        BCP-47 language code (``None`` = auto-detect).
+    task : str
+        ``"transcribe"`` (default).
+    chunk_duration : float
+        Duration of each sent chunk in seconds.
+
+    Returns
+    -------
+    tuple[str, float, float, float, list[dict]]
+        ``(text, rtf, audio_duration, wall_time, segments)``.
+    """
     uri = f"ws://{host}:{port}/listen"
     uid = str(uuid.uuid4())
 
@@ -40,41 +82,30 @@ async def transcribe_file(
     duration = len(audio) / 16000
     chunk_size = int(chunk_duration * 16000)
 
-    completed_segments = []  # Only finalized segments
-    last_partial = None  # The most recent partial (in-progress) segment
+    completed_segments: list[dict] = []
 
-    def merge_segments(incoming):
-        nonlocal completed_segments, last_partial
-
+    def _merge(incoming: list[dict]) -> None:
         for seg in incoming:
-            if seg.get("completed", False):
-                # Deduplicate: skip if identical to the last completed segment
-                if completed_segments:
-                    prev = completed_segments[-1]
-                    if (
-                        seg["start"] == prev["start"]
-                        and seg["end"] == prev["end"]
-                        and seg["text"] == prev["text"]
-                    ):
-                        continue
-                completed_segments.append(seg)
-                # Clear partial if it overlaps with the newly completed segment
-                last_partial = None
-            else:
-                # Partials just replace each other — only keep the latest
-                last_partial = seg
+            if not seg.get("completed", False):
+                continue
+            if completed_segments:
+                prev = completed_segments[-1]
+                if (
+                    seg["start"] == prev["start"]
+                    and seg["end"] == prev["end"]
+                    and seg["text"] == prev["text"]
+                ):
+                    continue
+            completed_segments.append(seg)
 
     async with websockets.connect(uri) as ws:
-        options = {
-            "uid": uid,
-            "language": language,
-            "task": task,
-            "use_vad": True,
-        }
-        await ws.send(json.dumps(options))
+        await ws.send(
+            json.dumps(
+                {"uid": uid, "language": language, "task": task, "use_vad": True}
+            )
+        )
 
-        response = await ws.recv()
-        msg = json.loads(response)
+        msg = json.loads(await ws.recv())
         assert msg.get("message") == "SERVER_READY", f"Server not ready: {msg}"
 
         start_time = time.time()
@@ -85,62 +116,46 @@ async def transcribe_file(
             try:
                 while True:
                     response = await asyncio.wait_for(ws.recv(), timeout=0.1)
-                    msg = json.loads(response)
-                    if "segments" in msg:
-                        merge_segments(msg["segments"])
+                    data = json.loads(response)
+                    if "segments" in data:
+                        _merge(data["segments"])
             except asyncio.TimeoutError:
                 pass
 
             elapsed = time.time() - start_time
             sent = (i + chunk_size) / 16000
             if sent < duration:
-                wait = max(0, sent - elapsed)
-                await asyncio.sleep(wait)
+                await asyncio.sleep(max(0, sent - elapsed))
 
         await ws.send(b"END_OF_AUDIO")
 
         try:
             while True:
                 response = await asyncio.wait_for(ws.recv(), timeout=5.0)
-                msg = json.loads(response)
-                if "segments" in msg:
-                    merge_segments(msg["segments"])
-        except websockets.exceptions.ConnectionClosed:
-            pass
-        except asyncio.TimeoutError:
+                data = json.loads(response)
+                if "segments" in data:
+                    _merge(data["segments"])
+        except (websockets.exceptions.ConnectionClosed, asyncio.TimeoutError):
             pass
 
     total_time = time.time() - start_time
     rtf = total_time / duration if duration > 0 else float("inf")
-
-    # Build final segments: all completed + last partial (if any)
-    final_segments = list(completed_segments)
-    if last_partial:
-        final_segments.append(last_partial)
-
     text = " ".join(seg["text"] for seg in completed_segments)
-    return text, rtf, duration, total_time, final_segments
+    return text, rtf, duration, total_time, completed_segments
 
 
-async def main():
-    import argparse
-
-    parser = argparse.ArgumentParser()
+async def main() -> None:
+    parser = argparse.ArgumentParser(description="WhisperLive benchmark (RTF + WER)")
     parser.add_argument("--file", required=True, help="Audio file path")
     parser.add_argument("--reference", default=None, help="Reference text for WER")
-    parser.add_argument("--language", default=None)
+    parser.add_argument("--language", default=None, help="Language code")
     parser.add_argument("--host", default="localhost")
     parser.add_argument("--port", type=int, default=8000)
     args = parser.parse_args()
 
     print(f"File: {args.file}")
-    print(f"Reference: {args.reference}")
-
     text, rtf, duration, total_time, segments = await transcribe_file(
-        file_path=args.file,
-        host=args.host,
-        port=args.port,
-        language=args.language,
+        args.file, host=args.host, port=args.port, language=args.language
     )
 
     print(f"\nTranscription ({duration:.2f}s audio, {total_time:.2f}s wall time):")
@@ -149,16 +164,8 @@ async def main():
     print(f"Text: {text}")
 
     if args.reference:
-        import re
-
-        def normalize(s: str) -> str:
-            s = s.lower()
-            s = re.sub(r"[^\w\s]", "", s)  # strip punctuation
-            s = re.sub(r"\s+", " ", s).strip()
-            return s
-
         raw_error = wer(args.reference, text)
-        norm_error = wer(normalize(args.reference), normalize(text))
+        norm_error = wer(_normalize(args.reference), _normalize(text))
         print(f"\nWER (raw):        {raw_error:.4f}")
         print(f"WER (normalized): {norm_error:.4f}")
 

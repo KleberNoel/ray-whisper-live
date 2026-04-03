@@ -1,117 +1,34 @@
-"""Whisper transcription deployment using faster-whisper."""
-
+import ctypes
 import logging
 import shutil
-import threading
-import ctypes
-from typing import Optional
 
 import numpy as np
-
 from ray import serve
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_TEMPERATURES: list[float] = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
+
 
 def _cuda_available() -> bool:
-    """Check if CUDA is actually usable by CTranslate2."""
+    """Check CUDA availability without a PyTorch dependency.
+
+    Probes for ``nvidia-smi``, ``libcuda.so.1`` and ``libcublas.so.12``
+    via :func:`ctypes.CDLL`.
+
+    Returns
+    -------
+    bool
+        ``True`` when CTranslate2 can use the GPU.
+    """
     if shutil.which("nvidia-smi") is None:
         return False
-
-    required_libs = ["libcuda.so.1", "libcublas.so.12"]
-    for lib in required_libs:
+    for lib in ("libcuda.so.1", "libcublas.so.12"):
         try:
             ctypes.CDLL(lib)
         except OSError:
             return False
-
     return True
-
-
-class WhisperTranscriber:
-    """faster-whisper transcription engine."""
-
-    def __init__(
-        self,
-        model_size: str = "large-v3-turbo",
-        device: str = "cuda",
-        compute_type: str = "float16",
-    ):
-        from faster_whisper import WhisperModel
-
-        self.model_size = model_size
-        self.device = device
-        self.compute_type = compute_type
-
-        logger.info(f"Loading Whisper model: {model_size} on {device} ({compute_type})")
-        self.model = WhisperModel(
-            model_size,
-            device=device,
-            compute_type=compute_type,
-            download_root="/tmp/whisper-models",
-        )
-        logger.info("Whisper model loaded successfully")
-
-    def transcribe(
-        self,
-        audio: np.ndarray,
-        language: Optional[str] = None,
-        task: str = "transcribe",
-        beam_size: int = 5,
-        no_speech_threshold: float = 0.45,
-        condition_on_previous_text: bool = True,
-        initial_prompt: Optional[str] = None,
-    ) -> dict:
-        """
-        Transcribe audio with high-accuracy settings.
-
-        Args:
-            audio: Audio samples at 16kHz
-            language: Language code (None for auto-detect)
-            task: "transcribe" or "translate"
-            beam_size: Beam size for decoding (5 for high accuracy)
-            no_speech_threshold: Threshold for filtering silent segments
-            condition_on_previous_text: Use previous text as context
-            initial_prompt: Optional prompt to guide transcription
-
-        Returns:
-            Dict with segments, language info, and metadata
-        """
-        temperatures = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
-
-        segments, info = self.model.transcribe(
-            audio,
-            language=language,
-            task=task,
-            beam_size=beam_size,
-            temperature=temperatures,
-            no_speech_threshold=no_speech_threshold,
-            condition_on_previous_text=condition_on_previous_text,
-            initial_prompt=initial_prompt,
-            vad_filter=False,
-            word_timestamps=False,
-            suppress_blank=True,
-            suppress_tokens=[-1],
-        )
-
-        result_segments = []
-        for seg in segments:
-            result_segments.append(
-                {
-                    "start": round(seg.start, 3),
-                    "end": round(seg.end, 3),
-                    "text": seg.text.strip(),
-                    "no_speech_prob": seg.no_speech_prob,
-                    "avg_logprob": seg.avg_logprob,
-                }
-            )
-
-        return {
-            "segments": result_segments,
-            "language": info.language if info else None,
-            "language_probability": info.language_probability if info else None,
-            "duration": info.duration if info else None,
-        }
 
 
 @serve.deployment(
@@ -119,79 +36,101 @@ class WhisperTranscriber:
     num_replicas=1,
     ray_actor_options={"num_cpus": 1, "num_gpus": 0.25},
 )
-class WhisperTranscriberDeployment:
-    """Ray Serve deployment for Whisper transcription."""
+class WhisperTranscriber:
+    """Faster-whisper transcription on GPU.
 
-    def __init__(
-        self,
-        model_size: str = "large-v3-turbo",
-        beam_size: int = 5,
-        no_speech_threshold: float = 0.45,
-    ):
-        self.model_size = model_size
-        self.beam_size = beam_size
-        self.no_speech_threshold = no_speech_threshold
-        self.engine = None
-        self._lock = threading.Lock()
-        self._load_model()
+    Parameters
+    ----------
+    model_size : str
+        Hugging Face model identifier (e.g. ``"large-v3-turbo"``).
+    """
 
-    def _load_model(self):
-        """Load the Whisper model."""
+    def __init__(self, model_size: str = "large-v3-turbo") -> None:
+        from faster_whisper import WhisperModel
+
         device = "cuda" if _cuda_available() else "cpu"
         compute_type = "float16" if device == "cuda" else "int8"
-
-        self.engine = WhisperTranscriber(
-            model_size=self.model_size,
+        logger.info("Loading Whisper %s on %s (%s)", model_size, device, compute_type)
+        self.model = WhisperModel(
+            model_size,
             device=device,
             compute_type=compute_type,
+            download_root="/tmp/whisper-models",
         )
-        logger.info(
-            f"WhisperTranscriberDeployment ready (device={device}, "
-            f"compute_type={compute_type})"
-        )
+        logger.info("Whisper model loaded")
 
     def transcribe(
         self,
         audio: np.ndarray,
-        language: Optional[str] = None,
+        *,
+        language: str | None = None,
         task: str = "transcribe",
-        initial_prompt: Optional[str] = None,
+        initial_prompt: str | None = None,
+        beam_size: int = 5,
+        no_speech_threshold: float = 0.45,
+        temperature: list[float] | None = None,
+        condition_on_previous_text: bool = True,
     ) -> dict:
+        """Transcribe an audio chunk.
+
+        Parameters
+        ----------
+        audio : np.ndarray
+            Float32 samples at 16 kHz, shape ``(n_samples,)``.
+        language : str or None
+            BCP-47 language code.  ``None`` for auto-detection.
+        task : str
+            ``"transcribe"`` (default).
+        initial_prompt : str or None
+            Optional decoder prompt for context priming.
+        beam_size : int
+            Beam width (higher is more accurate but slower).
+        no_speech_threshold : float
+            Segments above this no-speech probability are discarded.
+        temperature : list[float] or None
+            Temperature fallback schedule.  Defaults to
+            ``[0.0, 0.2, 0.4, 0.6, 0.8, 1.0]``.
+        condition_on_previous_text : bool
+            Feed previous output as decoder context.
+
+        Returns
+        -------
+        dict
+            ``{"segments": [...], "language": str,
+            "language_probability": float}`` on success, or
+            ``{"error": str, "segments": []}`` on failure.
         """
-        Transcribe audio chunk.
+        if temperature is None:
+            temperature = DEFAULT_TEMPERATURES
 
-        Args:
-            audio: Audio samples at 16kHz
-            language: Language code (None for auto-detect)
-            task: "transcribe" or "translate"
-            initial_prompt: Optional prompt to guide transcription
-
-        Returns:
-            Dict with transcription segments and metadata
-        """
-        if self.engine is None:
-            return {"error": "Model not loaded", "segments": []}
-
-        with self._lock:
-            try:
-                result = self.engine.transcribe(
-                    audio=audio,
-                    language=language,
-                    task=task,
-                    beam_size=self.beam_size,
-                    no_speech_threshold=self.no_speech_threshold,
-                    condition_on_previous_text=True,
-                    initial_prompt=initial_prompt,
-                )
-                return result
-            except Exception as e:
-                logger.error(f"Transcription error: {e}")
-                return {"error": str(e), "segments": []}
-
-    def health_check(self) -> dict:
-        """Health check endpoint."""
-        return {
-            "status": "healthy",
-            "model": self.model_size,
-            "beam_size": self.beam_size,
-        }
+        try:
+            segments, info = self.model.transcribe(
+                audio,
+                language=language,
+                task=task,
+                beam_size=beam_size,
+                temperature=temperature,
+                condition_on_previous_text=condition_on_previous_text,
+                no_speech_threshold=no_speech_threshold,
+                initial_prompt=initial_prompt,
+                vad_filter=False,
+                word_timestamps=False,
+                suppress_blank=True,
+                suppress_tokens=[-1],
+            )
+            return {
+                "segments": [
+                    {
+                        "start": round(s.start, 3),
+                        "end": round(s.end, 3),
+                        "text": s.text.strip(),
+                        "no_speech_prob": s.no_speech_prob,
+                    }
+                    for s in segments
+                ],
+                "language": info.language,
+                "language_probability": info.language_probability,
+            }
+        except Exception as e:
+            logger.error("Transcription error: %s", e)
+            return {"error": str(e), "segments": []}
