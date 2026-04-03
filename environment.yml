@@ -1,0 +1,15 @@
+name: ray-whisper-live
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+    - "ray[serve]>=2.9"
+    - faster-whisper>=1.0
+    - onnxruntime-gpu
+    - websockets>=12
+    - numpy
+    - soundfile
+    - scipy
