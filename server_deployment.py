@@ -136,10 +136,6 @@ class WhisperLiveServer:
         self.transcriber_handle = transcriber_handle
         self.sessions: dict[str, ClientSession] = {}
 
-    # ------------------------------------------------------------------
-    # Routes
-    # ------------------------------------------------------------------
-
     @app.get("/health")
     async def health(self) -> dict:
         """Liveness probe."""
