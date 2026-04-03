@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from faster_whisper.vad import VadOptions, get_speech_timestamps
 from ray import serve
 
 logger = logging.getLogger(__name__)
@@ -21,25 +22,6 @@ SAME_OUTPUT_THRESHOLD: int = 10
 # ---------------------------------------------------------------------------
 # Per-session configuration
 # ---------------------------------------------------------------------------
-
-
-@dataclass
-class VadConfig:
-    """Voice-activity-detection settings (Silero via *faster_whisper.vad*).
-
-    Parameters
-    ----------
-    threshold : float
-        Speech probability threshold in ``[0, 1]``.
-    min_silence_duration_ms : int
-        Minimum silence duration before splitting speech (ms).
-    speech_pad_ms : int
-        Padding added around detected speech regions (ms).
-    """
-
-    threshold: float = 0.5
-    min_silence_duration_ms: int = 2000
-    speech_pad_ms: int = 400
 
 
 @dataclass
@@ -72,27 +54,7 @@ class AsrConfig:
 
 
 class ClientSession:
-    """Manages audio state and configuration for a single WebSocket client.
-
-    Parameters
-    ----------
-    uid : str
-        Unique client identifier.
-    websocket : WebSocket
-        The FastAPI WebSocket connection.
-    language : str or None
-        BCP-47 language code, ``None`` for auto-detection.
-    task : str
-        ``"transcribe"`` (default).
-    initial_prompt : str or None
-        Optional decoder prompt.
-    use_vad : bool
-        Whether to gate transcription on VAD.
-    vad : VadConfig
-        Voice-activity-detection settings.
-    asr : AsrConfig
-        ASR / decoding settings.
-    """
+    """Manages audio state and configuration for a single WebSocket client."""
 
     def __init__(
         self,
@@ -103,7 +65,7 @@ class ClientSession:
         task: str = "transcribe",
         initial_prompt: str | None = None,
         use_vad: bool = True,
-        vad: VadConfig | None = None,
+        vad: VadOptions | None = None,
         asr: AsrConfig | None = None,
     ) -> None:
         self.uid = uid
@@ -112,7 +74,7 @@ class ClientSession:
         self.task = task
         self.initial_prompt = initial_prompt
         self.use_vad = use_vad
-        self.vad = vad or VadConfig()
+        self.vad = vad or VadOptions()
         self.asr = asr or AsrConfig()
 
         # Audio buffer
@@ -133,13 +95,7 @@ class ClientSession:
         self.last_completed_end: float = -1.0
 
     def add_frames(self, frame: np.ndarray) -> None:
-        """Append audio frames and trim when the buffer exceeds *MAX_BUFFER_SECONDS*.
-
-        Parameters
-        ----------
-        frame : np.ndarray
-            Float32 audio samples at 16 kHz.
-        """
+        """Append audio frames, trimming when the buffer exceeds *MAX_BUFFER_SECONDS*."""
         if self.audio_buffer.size > 0:
             self.audio_buffer = np.concatenate([self.audio_buffer, frame], axis=0)
         else:
@@ -153,14 +109,7 @@ class ClientSession:
                 self.timestamp_offset = self.frames_offset
 
     def get_audio_chunk(self) -> tuple[np.ndarray | None, float]:
-        """Return the un-transcribed tail of the buffer.
-
-        Returns
-        -------
-        tuple[np.ndarray | None, float]
-            ``(chunk, duration_seconds)`` or ``(None, 0.0)`` when
-            there is nothing new.
-        """
+        """Return the un-transcribed tail of the buffer, or ``(None, 0.0)``."""
         samples_taken = max(
             0, int((self.timestamp_offset - self.frames_offset) * SAMPLE_RATE)
         )
@@ -170,13 +119,7 @@ class ClientSession:
         return chunk, chunk.shape[0] / SAMPLE_RATE
 
     async def send_response(self, segments: list[dict]) -> None:
-        """Send transcription segments to the client.
-
-        Parameters
-        ----------
-        segments : list[dict]
-            Dicts with ``start``, ``end``, ``text``, ``completed``.
-        """
+        """Send transcription segments to the client."""
         if not self.connected:
             return
         try:
@@ -204,21 +147,11 @@ class WhisperLiveServer:
 
     VAD runs inline (CPU, via ``faster_whisper.vad``).  Transcription is
     delegated to :class:`WhisperTranscriber` over Ray.
-
-    Parameters
-    ----------
-    transcriber_handle
-        Ray Serve handle to the ``WhisperTranscriber`` deployment.
     """
 
     def __init__(self, transcriber_handle) -> None:  # noqa: ANN001
         self.transcriber_handle = transcriber_handle
         self.sessions: dict[str, ClientSession] = {}
-
-        from faster_whisper.vad import VadOptions, get_speech_timestamps
-
-        self._get_speech_timestamps = get_speech_timestamps
-        self._VadOptions = VadOptions
 
     # ------------------------------------------------------------------
     # Routes
@@ -241,7 +174,7 @@ class WhisperLiveServer:
             uid = str(options.get("uid", "unknown"))
 
             # Build per-session VAD / ASR config from client options
-            vad_cfg = VadConfig(
+            vad_cfg = VadOptions(
                 threshold=float(options.get("vad_threshold", 0.5)),
                 min_silence_duration_ms=int(
                     options.get("min_silence_duration_ms", 2000)
@@ -340,52 +273,24 @@ class WhisperLiveServer:
             await self._transcribe_if_ready(session)
 
     def _has_speech(self, session: ClientSession) -> bool:
-        """Check the buffer tail for speech using Silero VAD.
-
-        Parameters
-        ----------
-        session : ClientSession
-            Active session (provides audio buffer and
-            :class:`VadConfig`).
-
-        Returns
-        -------
-        bool
-            ``True`` when speech is detected.
-        """
+        """Check the buffer tail for speech using Silero VAD."""
         if session.audio_buffer.shape[0] < 512:
             return True
-
         tail = session.audio_buffer[-2048:]
-        vad_opts = self._VadOptions(
-            threshold=session.vad.threshold,
-            min_silence_duration_ms=session.vad.min_silence_duration_ms,
-            speech_pad_ms=session.vad.speech_pad_ms,
-        )
-        timestamps = self._get_speech_timestamps(tail, vad_opts)
-
+        timestamps = get_speech_timestamps(tail, session.vad)
         if not timestamps:
             session.no_voice_activity_chunks += 1
             return False
-
         session.no_voice_activity_chunks = 0
         return True
 
-    async def _transcribe_if_ready(self, session: ClientSession) -> None:
-        """Transcribe when at least *MIN_AUDIO_DURATION* seconds are buffered.
-
-        Parameters
-        ----------
-        session : ClientSession
-            Active session.
-        """
-        chunk, duration = session.get_audio_chunk()
-        if chunk is None or duration < MIN_AUDIO_DURATION:
-            return
-
+    async def _call_transcriber(
+        self, session: ClientSession, audio: np.ndarray
+    ) -> dict:
+        """Dispatch a transcription request to the Ray transcriber."""
         asr = session.asr
-        result: dict = await self.transcriber_handle.transcribe.remote(
-            audio=chunk,
+        return await self.transcriber_handle.transcribe.remote(
+            audio=audio,
             language=session.language,
             task=session.task,
             initial_prompt=session.initial_prompt,
@@ -394,6 +299,14 @@ class WhisperLiveServer:
             temperature=asr.temperature,
             condition_on_previous_text=asr.condition_on_previous_text,
         )
+
+    async def _transcribe_if_ready(self, session: ClientSession) -> None:
+        """Transcribe when at least *MIN_AUDIO_DURATION* seconds are buffered."""
+        chunk, duration = session.get_audio_chunk()
+        if chunk is None or duration < MIN_AUDIO_DURATION:
+            return
+
+        result = await self._call_transcriber(session, chunk)
 
         if "error" in result:
             logger.error("Transcription error for %s: %s", session.uid, result["error"])
@@ -415,7 +328,7 @@ class WhisperLiveServer:
                 }
             )
 
-        no_speech_thresh = asr.no_speech_threshold
+        no_speech_thresh = session.asr.no_speech_threshold
         response_segments: list[dict] = []
         last_completed_offset: float = 0.0
 
@@ -475,28 +388,12 @@ class WhisperLiveServer:
             await session.send_response(response_segments)
 
     async def _process_remaining(self, session: ClientSession) -> None:
-        """Flush any un-transcribed audio left in the buffer.
-
-        Parameters
-        ----------
-        session : ClientSession
-            Active session.
-        """
+        """Flush any un-transcribed audio left in the buffer."""
         chunk, duration = session.get_audio_chunk()
         if chunk is None or duration <= 0:
             return
 
-        asr = session.asr
-        result: dict = await self.transcriber_handle.transcribe.remote(
-            audio=chunk,
-            language=session.language,
-            task=session.task,
-            initial_prompt=session.initial_prompt,
-            beam_size=asr.beam_size,
-            no_speech_threshold=asr.no_speech_threshold,
-            temperature=asr.temperature,
-            condition_on_previous_text=asr.condition_on_previous_text,
-        )
+        result = await self._call_transcriber(session, chunk)
 
         segments: list[dict] = result.get("segments", [])
         response_segments: list[dict] = []

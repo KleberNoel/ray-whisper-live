@@ -4,87 +4,39 @@ import json
 import time
 import uuid
 
-import numpy as np
-import soundfile as sf
 import websockets
+from faster_whisper import decode_audio
 
 
-def load_audio(file_path: str, target_sr: int = 16000) -> np.ndarray:
-    """Load an audio file and resample to *target_sr* Hz mono float32.
-
-    Parameters
-    ----------
-    file_path : str
-        Path to any format supported by *libsndfile*.
-    target_sr : int
-        Target sample rate in Hz.
-
-    Returns
-    -------
-    np.ndarray
-        1-D float32 array normalised to ``[-1, 1]``.
-    """
-    audio, sr = sf.read(file_path, dtype="float32")
-    if audio.ndim > 1:
-        audio = audio.mean(axis=1)
-    if sr != target_sr:
-        import scipy.signal
-
-        num_samples = int(len(audio) * target_sr / sr)
-        audio = scipy.signal.resample(audio, num_samples).astype(np.float32)
-    return audio
-
-
-def _build_options(
-    uid: str,
-    *,
-    language: str | None = None,
-    task: str = "transcribe",
-    use_vad: bool = True,
-    beam_size: int | None = None,
-    no_speech_threshold: float | None = None,
-    vad_threshold: float | None = None,
-    initial_prompt: str | None = None,
-) -> dict:
+def _build_options(uid: str, **overrides: object) -> dict:
     """Build the JSON options dict sent on WebSocket connect.
 
-    Only includes keys whose values differ from the server defaults so
-    that the server's own defaults apply when omitted.
-
-    Parameters
-    ----------
-    uid : str
-        Unique session identifier.
-    language : str or None
-        BCP-47 language code (``None`` = auto-detect).
-    task : str
-        ``"transcribe"`` (default).
-    use_vad : bool
-        Enable voice-activity gating.
-    beam_size : int or None
-        Override server default beam width.
-    no_speech_threshold : float or None
-        Override server default no-speech threshold.
-    vad_threshold : float or None
-        Override server default VAD threshold.
-    initial_prompt : str or None
-        Decoder prompt for context priming.
-
-    Returns
-    -------
-    dict
-        Ready-to-serialise options dict.
+    Keys with ``None`` values are omitted so server defaults apply.
     """
-    opts: dict = {"uid": uid, "language": language, "task": task, "use_vad": use_vad}
-    if beam_size is not None:
-        opts["beam_size"] = beam_size
-    if no_speech_threshold is not None:
-        opts["no_speech_threshold"] = no_speech_threshold
-    if vad_threshold is not None:
-        opts["vad_threshold"] = vad_threshold
-    if initial_prompt is not None:
-        opts["initial_prompt"] = initial_prompt
+    opts: dict = {"uid": uid, "language": None, "task": "transcribe", "use_vad": True}
+    opts.update({k: v for k, v in overrides.items() if v is not None})
     return opts
+
+
+async def _drain_responses(
+    ws: websockets.ClientConnection,
+    *,
+    timeout: float = 0.1,
+) -> None:
+    """Read and print all pending transcription responses."""
+    try:
+        while True:
+            data = json.loads(await asyncio.wait_for(ws.recv(), timeout=timeout))
+            if "segments" in data:
+                for seg in data["segments"]:
+                    marker = "[DONE]" if seg.get("completed") else "[...]"
+                    print(
+                        f"  {marker} [{seg['start']}s -> {seg['end']}s] {seg['text']}"
+                    )
+            elif "status" in data:
+                print(f"  Status: {data['status']} - {data['message']}")
+    except (asyncio.TimeoutError, websockets.exceptions.ConnectionClosed):
+        pass
 
 
 async def transcribe_file(
@@ -100,36 +52,12 @@ async def transcribe_file(
     vad_threshold: float | None = None,
     initial_prompt: str | None = None,
 ) -> None:
-    """Stream an audio file to the server and print live transcriptions.
-
-    Parameters
-    ----------
-    file_path : str
-        Path to the audio file.
-    host : str
-        Server hostname.
-    port : int
-        Server port.
-    language : str or None
-        Language code (``None`` = auto-detect).
-    task : str
-        ``"transcribe"`` (default).
-    chunk_duration : float
-        Duration of each sent chunk in seconds.
-    beam_size : int or None
-        Override beam width.
-    no_speech_threshold : float or None
-        Override no-speech threshold.
-    vad_threshold : float or None
-        Override VAD threshold.
-    initial_prompt : str or None
-        Decoder prompt.
-    """
+    """Stream an audio file to the server and print live transcriptions."""
     uri = f"ws://{host}:{port}/listen"
     uid = str(uuid.uuid4())
 
     print(f"Loading audio: {file_path}")
-    audio = load_audio(file_path)
+    audio = decode_audio(file_path, sampling_rate=16000)
     duration = len(audio) / 16000
     print(f"Audio duration: {duration:.2f}s")
 
@@ -159,21 +87,7 @@ async def transcribe_file(
         for i in range(0, len(audio), chunk_size):
             chunk = audio[i : i + chunk_size]
             await ws.send(chunk.tobytes())
-
-            try:
-                while True:
-                    response = await asyncio.wait_for(ws.recv(), timeout=0.1)
-                    data = json.loads(response)
-                    if "segments" in data:
-                        for seg in data["segments"]:
-                            marker = "[DONE]" if seg.get("completed") else "[...]"
-                            print(
-                                f"  {marker} [{seg['start']}s -> {seg['end']}s] {seg['text']}"
-                            )
-                    elif "status" in data:
-                        print(f"  Status: {data['status']} - {data['message']}")
-            except asyncio.TimeoutError:
-                pass
+            await _drain_responses(ws, timeout=0.1)
 
             elapsed = time.time() - start_time
             sent = (i + chunk_size) / 16000
@@ -184,20 +98,7 @@ async def transcribe_file(
         await ws.send(b"END_OF_AUDIO")
 
         print("Waiting for final results...")
-        try:
-            while True:
-                response = await asyncio.wait_for(ws.recv(), timeout=5.0)
-                data = json.loads(response)
-                if "segments" in data:
-                    for seg in data["segments"]:
-                        marker = "[DONE]" if seg.get("completed") else "[...]"
-                        print(
-                            f"  {marker} [{seg['start']}s -> {seg['end']}s] {seg['text']}"
-                        )
-                elif "status" in data:
-                    print(f"  Status: {data['status']} - {data['message']}")
-        except (websockets.exceptions.ConnectionClosed, asyncio.TimeoutError):
-            pass
+        await _drain_responses(ws, timeout=5.0)
 
     print("Done")
 

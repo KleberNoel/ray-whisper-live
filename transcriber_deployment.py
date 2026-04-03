@@ -1,6 +1,4 @@
-import ctypes
 import logging
-import shutil
 
 import numpy as np
 from ray import serve
@@ -8,27 +6,6 @@ from ray import serve
 logger = logging.getLogger(__name__)
 
 DEFAULT_TEMPERATURES: list[float] = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
-
-
-def _cuda_available() -> bool:
-    """Check CUDA availability without a PyTorch dependency.
-
-    Probes for ``nvidia-smi``, ``libcuda.so.1`` and ``libcublas.so.12``
-    via :func:`ctypes.CDLL`.
-
-    Returns
-    -------
-    bool
-        ``True`` when CTranslate2 can use the GPU.
-    """
-    if shutil.which("nvidia-smi") is None:
-        return False
-    for lib in ("libcuda.so.1", "libcublas.so.12"):
-        try:
-            ctypes.CDLL(lib)
-        except OSError:
-            return False
-    return True
 
 
 @serve.deployment(
@@ -48,13 +25,11 @@ class WhisperTranscriber:
     def __init__(self, model_size: str = "large-v3-turbo") -> None:
         from faster_whisper import WhisperModel
 
-        device = "cuda" if _cuda_available() else "cpu"
-        compute_type = "float16" if device == "cuda" else "int8"
-        logger.info("Loading Whisper %s on %s (%s)", model_size, device, compute_type)
+        logger.info("Loading Whisper %s (device=auto)", model_size)
         self.model = WhisperModel(
             model_size,
-            device=device,
-            compute_type=compute_type,
+            device="auto",
+            compute_type="auto",
             download_root="/tmp/whisper-models",
         )
         logger.info("Whisper model loaded")

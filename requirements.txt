@@ -71,11 +71,9 @@ referencing==0.37.0
 requests==2.33.1
 rich==14.3.3
 rpds-py==0.30.0
-scipy==1.17.1
 shellingham==1.5.4
 six==1.17.0
 smart_open==7.5.1
-soundfile==0.13.1
 starlette==1.0.0
 sympy==1.14.0
 tokenizers==0.22.2

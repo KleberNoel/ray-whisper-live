@@ -5,36 +5,9 @@ import re
 import time
 import uuid
 
-import numpy as np
-import soundfile as sf
 import websockets
+from faster_whisper import decode_audio
 from jiwer import wer
-
-
-def load_audio(file_path: str, target_sr: int = 16000) -> np.ndarray:
-    """Load an audio file and resample to *target_sr* Hz mono float32.
-
-    Parameters
-    ----------
-    file_path : str
-        Path to any format supported by *libsndfile*.
-    target_sr : int
-        Target sample rate in Hz.
-
-    Returns
-    -------
-    np.ndarray
-        1-D float32 array normalised to ``[-1, 1]``.
-    """
-    audio, sr = sf.read(file_path, dtype="float32")
-    if audio.ndim > 1:
-        audio = audio.mean(axis=1)
-    if sr != target_sr:
-        import scipy.signal
-
-        num_samples = int(len(audio) * target_sr / sr)
-        audio = scipy.signal.resample(audio, num_samples).astype(np.float32)
-    return audio
 
 
 def _normalize(text: str) -> str:
@@ -55,21 +28,6 @@ async def transcribe_file(
 ) -> tuple[str, float, float, float, list[dict]]:
     """Stream an audio file and collect completed segments.
 
-    Parameters
-    ----------
-    file_path : str
-        Path to the audio file.
-    host : str
-        Server hostname.
-    port : int
-        Server port.
-    language : str or None
-        BCP-47 language code (``None`` = auto-detect).
-    task : str
-        ``"transcribe"`` (default).
-    chunk_duration : float
-        Duration of each sent chunk in seconds.
-
     Returns
     -------
     tuple[str, float, float, float, list[dict]]
@@ -78,7 +36,7 @@ async def transcribe_file(
     uri = f"ws://{host}:{port}/listen"
     uid = str(uuid.uuid4())
 
-    audio = load_audio(file_path)
+    audio = decode_audio(file_path, sampling_rate=16000)
     duration = len(audio) / 16000
     chunk_size = int(chunk_duration * 16000)
 
