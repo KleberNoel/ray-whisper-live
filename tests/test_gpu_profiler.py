@@ -1,9 +1,8 @@
-import time
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from src.gpu_profiler import GpuProfiler, ProfileResult, _NvmlMemoryInfo
+from src.gpu_profiler import GpuProfiler, ProfileResult
 
 
 class TestProfileResult:
@@ -66,14 +65,6 @@ class TestGpuProfiler:
         # Track call count for varying responses
         self._mem_call_count = 0
         self._mem_values: list[int] = [1 * 1024**3]  # Default: 1 GiB
-
-        def fake_get_memory(handle, mem_ptr):  # noqa: ANN001
-            mem = _NvmlMemoryInfo.from_address(
-                id(mem_ptr) if not hasattr(mem_ptr, "_obj") else id(mem_ptr._obj)
-            )
-            # We can't easily write to the ctypes struct through the pointer
-            # in a mock, so we use a different approach
-            return 0
 
         # Set up memory info mock to return controlled values
         mock_nvml.nvmlDeviceGetMemoryInfo.return_value = 0

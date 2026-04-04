@@ -19,7 +19,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install --upgrade pip
-          pip install ruff mypy pytest pytest-asyncio
+          pip install ruff mypy pytest pytest-asyncio black isort
           pip install numpy fastapi faster-whisper ray[serve]
 
       - name: Ruff lint
@@ -27,6 +27,12 @@ jobs:
 
       - name: Ruff format check
         run: ruff format --check src/ tests/ serve.py client.py benchmark.py
+
+      - name: Black format check
+        run: black --check src/ tests/ serve.py client.py benchmark.py
+
+      - name: isort check
+        run: isort --check --profile black src/ tests/ serve.py client.py benchmark.py
 
       - name: Type check
         run: mypy src/ --ignore-missing-imports --no-error-summary

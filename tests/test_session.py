@@ -1,6 +1,7 @@
+from unittest.mock import AsyncMock
+
 import numpy as np
 import pytest
-from unittest.mock import AsyncMock
 
 from src.config import DISCARD_SECONDS, MAX_BUFFER_SECONDS, SAMPLE_RATE
 from src.session import ClientSession
