@@ -14,7 +14,7 @@ DEFAULT_TEMPERATURES: list[float] = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
     ray_actor_options={"num_cpus": 1, "num_gpus": 0.25},
 )
 class WhisperTranscriber:
-    """Faster-whisper transcription on GPU.
+    """Faster-whisper transcription on GPU using ``large-v3-turbo``.
 
     Parameters
     ----------

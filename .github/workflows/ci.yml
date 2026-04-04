@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install ruff mypy pytest pytest-asyncio
+          pip install numpy fastapi faster-whisper ray[serve]
+
+      - name: Ruff lint
+        run: ruff check src/ tests/ serve.py client.py benchmark.py
+
+      - name: Ruff format check
+        run: ruff format --check src/ tests/ serve.py client.py benchmark.py
+
+      - name: Type check
+        run: mypy src/ --ignore-missing-imports --no-error-summary
+
+      - name: Unit tests
+        run: pytest tests/ -v --tb=short
