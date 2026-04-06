@@ -6,6 +6,12 @@ build-backend = "setuptools.build_meta"
 name = "ray-whisper-live"
 version = "0.1.0"
 requires-python = ">=3.11"
+dependencies = [
+    "faster-whisper>=1.1.1",
+    "ray[serve]",
+    "numpy",
+    "fastapi",
+]
 
 [tool.setuptools.packages.find]
 include = ["src*"]

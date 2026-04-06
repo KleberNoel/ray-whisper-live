@@ -20,7 +20,6 @@ jobs:
         run: |
           pip install --upgrade pip
           pip install ruff mypy pytest pytest-asyncio black isort
-          pip install numpy fastapi faster-whisper ray[serve]
           pip install -e .
 
       - name: Ruff lint
