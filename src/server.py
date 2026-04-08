@@ -5,7 +5,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from faster_whisper.vad import VadOptions
 from ray import serve
 
-from src.config import MIN_AUDIO_DURATION, SAME_OUTPUT_THRESHOLD, AsrConfig
+from src.config import MIN_AUDIO_DURATION, SAME_OUTPUT_THRESHOLD, SAMPLE_RATE, AsrConfig
 from src.session import ClientSession
 
 logger = logging.getLogger(__name__)
@@ -38,6 +38,11 @@ class WhisperLiveServer:
         transcriber_handle,
         vad_handle,
     ) -> None:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+            force=True,
+        )
         self.transcriber_handle = transcriber_handle
         self.vad_handle = vad_handle
         self.sessions: dict[str, ClientSession] = {}
@@ -177,6 +182,13 @@ class WhisperLiveServer:
             return True
 
         tail = session.audio_buffer[-2048:]
+        audio_length = tail.shape[0] / SAMPLE_RATE
+        logger.info(
+            "VAD  %s | globalStart=%.3fs audioLength=%.3fs",
+            session.uid,
+            session.timestamp_offset,
+            audio_length,
+        )
         has = await self.vad_handle.has_speech.remote(
             audio=tail,
             threshold=session.vad.threshold,
@@ -230,6 +242,12 @@ class WhisperLiveServer:
         if chunk is None or duration < MIN_AUDIO_DURATION:
             return
 
+        logger.info(
+            "ASR  %s | globalStart=%.3fs audioLength=%.3fs",
+            session.uid,
+            session.timestamp_offset,
+            duration,
+        )
         result = await self._call_transcriber(session, chunk)
 
         if "error" in result:
@@ -312,6 +330,12 @@ class WhisperLiveServer:
         if chunk is None or duration <= 0:
             return
 
+        logger.info(
+            "ASR  %s | flush globalStart=%.3fs audioLength=%.3fs",
+            session.uid,
+            session.timestamp_offset,
+            duration,
+        )
         result = await self._call_transcriber(session, chunk)
 
         segments: list[dict] = result.get("segments", [])

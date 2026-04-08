@@ -28,7 +28,7 @@ class SileroVadDeployment:
         self._model = get_vad_model()
         logger.info("Silero VAD model loaded")
 
-    def has_speech(
+    async def has_speech(
         self,
         audio: np.ndarray,
         *,
@@ -69,7 +69,7 @@ class SileroVadDeployment:
         timestamps = get_speech_timestamps(audio, opts)
         return len(timestamps) > 0
 
-    def get_speech_segments(
+    async def get_speech_segments(
         self,
         audio: np.ndarray,
         *,
