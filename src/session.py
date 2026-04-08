@@ -24,7 +24,7 @@ class ClientSession:
     websocket : WebSocket
         The client's WebSocket connection.
     language : str or None
-        BCP-47 language code.  ``None`` for auto-detection.
+        BCP-47 language code, or ``None`` to let Whisper auto-detect.
     task : str
         ``"transcribe"`` (default).
     initial_prompt : str or None
@@ -74,9 +74,6 @@ class ClientSession:
         # Connection state
         self.connected: bool = True
         self.last_completed_end: float = -1.0
-
-        # Language detection state
-        self.language_detected: bool = language is not None
 
     def add_frames(self, frame: np.ndarray) -> None:
         """Append audio frames, trimming when the buffer exceeds *MAX_BUFFER_SECONDS*.

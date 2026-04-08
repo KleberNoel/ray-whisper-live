@@ -8,9 +8,9 @@ import ray
 from ray import serve
 
 from src.gpu_profiler import GpuProfiler, ProfileResult
-from src.language_detector import LanguageDetector
 from src.server import WhisperLiveServer
 from src.transcriber import WhisperTranscriber
+from src.vad import SileroVadDeployment
 
 logging.basicConfig(
     level=logging.INFO,
@@ -18,9 +18,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Default static allocations (used in --mode static)
+# Default static allocation (used in --mode static)
 DEFAULT_TRANSCRIBER_GPU: float = 0.25
-DEFAULT_DETECTOR_GPU: float = 0.25
 
 
 def _generate_probe_audio(duration_s: float = 5.0) -> np.ndarray:
@@ -127,84 +126,18 @@ def _profile_transcriber(
     return result
 
 
-def _profile_detector(
-    model_size: str, profiler: GpuProfiler, probe_audio: np.ndarray
-) -> ProfileResult:
-    """Profile GPU memory for the language detector model.
-
-    Loads the model, runs language detection on probe audio, captures peak
-    GPU memory, then unloads.
-
-    Parameters
-    ----------
-    model_size : str
-        Whisper model identifier.
-    profiler : GpuProfiler
-        GPU memory profiler instance.
-    probe_audio : np.ndarray
-        Probe audio for detection.
-
-    Returns
-    -------
-    ProfileResult
-        Profiling result with peak memory and recommended ``num_gpus``.
-    """
-    from faster_whisper import WhisperModel
-
-    logger.info("Profiling language detector model: %s", model_size)
-    profiler.start()
-
-    model = WhisperModel(
-        model_size,
-        device="cuda",
-        compute_type="float16",
-        download_root="/tmp/whisper-models",
-    )
-
-    # Run detection to capture inference peak
-    _ = model.detect_language(probe_audio)
-    # Second pass for stable peak
-    _ = model.detect_language(probe_audio)
-
-    result = profiler.stop()
-    logger.info(
-        "Detector %s: delta=%.2f GiB, num_gpus=%.2f",
-        model_size,
-        result.delta_bytes / (1024**3),
-        result.num_gpus,
-    )
-
-    # Unload model
-    del model
-    gc.collect()
-
-    try:
-        import ctranslate2
-
-        ctranslate2.empty_cuda_cache()
-    except (ImportError, AttributeError):
-        pass
-
-    time.sleep(1.0)
-    return result
-
-
-def _run_dynamic_profiling(
-    model_size: str, lang_model_size: str
-) -> tuple[float, float]:
-    """Profile both models and return recommended num_gpus fractions.
+def _run_dynamic_profiling(model_size: str) -> float:
+    """Profile the transcriber model and return recommended num_gpus fraction.
 
     Parameters
     ----------
     model_size : str
         Transcriber model identifier.
-    lang_model_size : str
-        Language detector model identifier.
 
     Returns
     -------
-    tuple[float, float]
-        ``(transcriber_gpu, detector_gpu)`` fractions for Ray.
+    float
+        Recommended ``num_gpus`` fraction for Ray.
     """
     profiler = GpuProfiler(poll_interval_ms=5.0, margin=1.15)
     probe_audio = _generate_probe_audio(duration_s=5.0)
@@ -214,44 +147,18 @@ def _run_dynamic_profiling(
         profiler.total_bytes / (1024**3),
     )
 
-    # Profile transcriber first
     transcriber_result = _profile_transcriber(model_size, profiler, probe_audio)
-
-    # Profile detector (may share weights if same model family)
-    detector_result = _profile_detector(lang_model_size, profiler, probe_audio)
-
-    # Validate: both models need to fit on the GPU simultaneously
-    total_fraction = transcriber_result.num_gpus + detector_result.num_gpus
-    if total_fraction > 1.0:
-        logger.warning(
-            "Combined GPU fraction %.2f exceeds 1.0! "
-            "Models may not fit simultaneously. "
-            "Scaling down proportionally.",
-            total_fraction,
-        )
-        scale = 0.95 / total_fraction
-        transcriber_gpu = round(transcriber_result.num_gpus * scale * 20) / 20
-        detector_gpu = round(detector_result.num_gpus * scale * 20) / 20
-    else:
-        transcriber_gpu = transcriber_result.num_gpus
-        detector_gpu = detector_result.num_gpus
 
     logger.info(
         "=== Dynamic profiling complete ===\n"
-        "  Transcriber (%s): %.2f GiB -> num_gpus=%.2f\n"
-        "  Detector    (%s): %.2f GiB -> num_gpus=%.2f\n"
-        "  Total GPU fraction: %.2f",
+        "  Transcriber (%s): %.2f GiB -> num_gpus=%.2f",
         model_size,
         transcriber_result.delta_bytes / (1024**3),
-        transcriber_gpu,
-        lang_model_size,
-        detector_result.delta_bytes / (1024**3),
-        detector_gpu,
-        transcriber_gpu + detector_gpu,
+        transcriber_result.num_gpus,
     )
 
     profiler.shutdown()
-    return transcriber_gpu, detector_gpu
+    return transcriber_result.num_gpus
 
 
 def main() -> None:
@@ -259,9 +166,6 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Ray Serve WhisperLive")
     parser.add_argument(
         "--model-size", default="large-v3-turbo", help="Whisper transcription model"
-    )
-    parser.add_argument(
-        "--lang-model-size", default="large-v3", help="Whisper language detection model"
     )
     parser.add_argument(
         "--mode",
@@ -274,16 +178,13 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    # Determine GPU fractions
+    # Determine GPU fraction for the transcriber
     if args.mode == "dynamic":
         logger.info("Mode: dynamic — profiling GPU memory before deployment")
-        transcriber_gpu, detector_gpu = _run_dynamic_profiling(
-            args.model_size, args.lang_model_size
-        )
+        transcriber_gpu = _run_dynamic_profiling(args.model_size)
     else:
         logger.info("Mode: static — using fixed GPU allocations")
         transcriber_gpu = DEFAULT_TRANSCRIBER_GPU
-        detector_gpu = DEFAULT_DETECTOR_GPU
 
     ray.init(num_cpus=4, num_gpus=1, ignore_reinit_error=True)
     logger.info(
@@ -292,28 +193,25 @@ def main() -> None:
         ray.available_resources().get("CPU", 0),
     )
 
-    # Apply dynamic GPU fractions via .options()
+    # Transcriber — GPU
     transcriber = WhisperTranscriber.options(
         ray_actor_options={"num_cpus": 1, "num_gpus": transcriber_gpu},
     ).bind(model_size=args.model_size)
 
-    language_detector = LanguageDetector.options(
-        ray_actor_options={"num_cpus": 1, "num_gpus": detector_gpu},
-    ).bind(model_size=args.lang_model_size)
+    # Silero VAD — CPU only (ONNX)
+    vad = SileroVadDeployment.bind()
 
     server = WhisperLiveServer.bind(
         transcriber_handle=transcriber,
-        language_detector_handle=language_detector,
+        vad_handle=vad,
     )
     serve.run(server, route_prefix="/")
 
     logger.info(
         "WhisperLive ready: ws://localhost:8000/listen "
-        "(transcriber=%s [%.2f GPU], lang_detector=%s [%.2f GPU], mode=%s)",
+        "(transcriber=%s [%.2f GPU], vad=SileroVad [CPU], mode=%s)",
         args.model_size,
         transcriber_gpu,
-        args.lang_model_size,
-        detector_gpu,
         args.mode,
     )
 

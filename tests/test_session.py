@@ -17,13 +17,11 @@ class TestClientSessionInit:
         assert s.task == "transcribe"
         assert s.use_vad is True
         assert s.connected is True
-        assert s.language_detected is False
         assert s.audio_buffer.shape == (0,)
 
     def test_with_language(self, mock_websocket: AsyncMock) -> None:
         s = ClientSession("u2", mock_websocket, language="en")
         assert s.language == "en"
-        assert s.language_detected is True
 
     def test_initial_offsets(self, mock_websocket: AsyncMock) -> None:
         s = ClientSession("u3", mock_websocket)

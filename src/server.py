@@ -2,7 +2,7 @@ import logging
 
 import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from faster_whisper.vad import VadOptions, get_speech_timestamps
+from faster_whisper.vad import VadOptions
 from ray import serve
 
 from src.config import MIN_AUDIO_DURATION, SAME_OUTPUT_THRESHOLD, AsrConfig
@@ -20,28 +20,26 @@ app = FastAPI()
 )
 @serve.ingress(app)
 class WhisperLiveServer:
-    """WebSocket ingress that orchestrates Silero VAD, language detection,
-    and Whisper ASR.
+    """WebSocket ingress that orchestrates Silero VAD and Whisper ASR.
 
-    VAD runs inline (CPU, via ``faster_whisper.vad``).  Language detection
-    is delegated to :class:`LanguageDetector` and transcription to
-    :class:`WhisperTranscriber`, both over Ray.
+    VAD is delegated to :class:`SileroVadDeployment` (CPU, ONNX) and
+    transcription to :class:`WhisperTranscriber`, both over Ray.
 
     Parameters
     ----------
     transcriber_handle : object
         Ray Serve handle for the transcriber deployment.
-    language_detector_handle : object
-        Ray Serve handle for the language detector deployment.
+    vad_handle : object
+        Ray Serve handle for the Silero VAD deployment.
     """
 
     def __init__(  # noqa: ANN001
         self,
         transcriber_handle,
-        language_detector_handle,
+        vad_handle,
     ) -> None:
         self.transcriber_handle = transcriber_handle
-        self.language_detector_handle = language_detector_handle
+        self.vad_handle = vad_handle
         self.sessions: dict[str, ClientSession] = {}
 
     @app.get("/health")
@@ -157,17 +155,13 @@ class WhisperLiveServer:
             frame = np.frombuffer(data, dtype=np.float32)
             session.add_frames(frame)
 
-            if session.use_vad and not self._has_speech(session):
+            if session.use_vad and not await self._has_speech(session):
                 continue
-
-            # Detect language on first chunk with speech if not specified
-            if not session.language_detected:
-                await self._detect_language(session)
 
             await self._transcribe_if_ready(session)
 
-    def _has_speech(self, session: ClientSession) -> bool:
-        """Check the buffer tail for speech using Silero VAD.
+    async def _has_speech(self, session: ClientSession) -> bool:
+        """Check the buffer tail for speech via the SileroVad deployment.
 
         Parameters
         ----------
@@ -181,53 +175,20 @@ class WhisperLiveServer:
         """
         if session.audio_buffer.shape[0] < 512:
             return True
+
         tail = session.audio_buffer[-2048:]
-        timestamps = get_speech_timestamps(tail, session.vad)
-        if not timestamps:
+        has = await self.vad_handle.has_speech.remote(
+            audio=tail,
+            threshold=session.vad.threshold,
+            min_silence_duration_ms=session.vad.min_silence_duration_ms,
+            speech_pad_ms=session.vad.speech_pad_ms,
+        )
+
+        if not has:
             session.no_voice_activity_chunks += 1
             return False
         session.no_voice_activity_chunks = 0
         return True
-
-    async def _detect_language(self, session: ClientSession) -> None:
-        """Detect language using the LanguageDetector deployment.
-
-        Called once per session when no language was specified by the client.
-        Uses the current audio buffer for detection.
-
-        Parameters
-        ----------
-        session : ClientSession
-            The active client session.
-        """
-        chunk, duration = session.get_audio_chunk()
-        if chunk is None or duration < MIN_AUDIO_DURATION:
-            return
-
-        result = await self.language_detector_handle.detect.remote(audio=chunk)
-
-        if "error" in result:
-            logger.error(
-                "Language detection error for %s: %s", session.uid, result["error"]
-            )
-            return
-
-        session.language = result["language"]
-        session.language_detected = True
-        logger.info(
-            "Client %s: detected language=%s (prob=%.3f)",
-            session.uid,
-            result["language"],
-            result.get("language_probability", 0.0),
-        )
-
-        await session.websocket.send_json(
-            {
-                "uid": session.uid,
-                "language": result["language"],
-                "language_prob": result.get("language_probability", 0.0),
-            }
-        )
 
     async def _call_transcriber(
         self, session: ClientSession, audio: np.ndarray
@@ -350,10 +311,6 @@ class WhisperLiveServer:
         chunk, duration = session.get_audio_chunk()
         if chunk is None or duration <= 0:
             return
-
-        # Detect language if still unknown before final transcription
-        if not session.language_detected:
-            await self._detect_language(session)
 
         result = await self._call_transcriber(session, chunk)
 
